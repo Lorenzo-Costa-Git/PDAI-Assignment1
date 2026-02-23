@@ -458,7 +458,7 @@ if tax_factor <= 0 or fatigue == "Dead":
     **Recommended Strategy:** 0 mins activity | High hydration | 8+ hours sleep.
     """)
     
-    # Optional: Display a 100% Taxed chart even on rest days
+    # Display a 100% Taxed chart even on rest days
     fig_dead = go.Figure(go.Bar(y=['Stamina'], x=[100], orientation='h', marker=dict(color='#ff3131')))
     fig_dead.update_layout(height=100, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', showlegend=False, xaxis=dict(visible=False), yaxis=dict(visible=False))
     st.plotly_chart(fig_dead, use_container_width=True)
