@@ -110,8 +110,6 @@ sport_mets = load_and_map_mets()
 # --- 2. UI Layout ---
 st.set_page_config(page_title="NextRep: Dynamic Workouts Tailored to you", page_icon="📈")
 
-import streamlit as st
-import pandas as pd
 
 st.set_page_config(page_title="NextRep: Dynamic Workouts Tailored to you", page_icon="📈", layout="wide")
 
