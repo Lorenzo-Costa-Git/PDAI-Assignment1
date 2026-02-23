@@ -2,6 +2,46 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 
+def apply_nextrep_theme():
+    st.markdown("""
+        <style>
+        /* 1. Force the main container to Black */
+        .stApp, [data-testid="stAppViewContainer"] {
+            background-color: #000000 !important;
+        }
+
+        /* 2. Force the Sidebar to Black */
+        [data-testid="stSidebar"] {
+            background-color: #000000 !important;
+            border-right: 2px solid #39FF14 !important;
+        }
+
+        /* 3. Target the Header/Toolbar to prevent white strips at the top */
+        header[data-testid="stHeader"] {
+            background-color: rgba(0,0,0,0) !important;
+            color: #39FF14 !important;
+        }
+
+        /* 4. Force every possible text element to Neon Green */
+        h1, h2, h3, p, span, label, .stMarkdown, [data-testid="stMetricValue"] {
+            color: #39FF14 !important;
+            font-family: 'Orbitron', sans-serif !important;
+        }
+
+        /* 5. Hide the 'Theme' toggle menu so the user can't find it */
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        
+        /* 6. Fix for white dropdowns/widgets */
+        div[data-baseweb="select"] > div, 
+        div[data-baseweb="input"] > div,
+        div[data-baseweb="popover"] {
+            background-color: #050505 !important;
+            border: 1px solid #39FF14 !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
 # --- 1. Dynamic Data Loading Engine ---
 @st.cache_data
 def load_and_map_mets():
