@@ -1,6 +1,9 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+import google.generativeai as genai
+import json
+import urllib.parse
 
 def apply_nextrep_theme():
     st.markdown("""
@@ -106,6 +109,35 @@ def load_and_map_mets():
 
 # Load the dynamic mapping
 sport_mets = load_and_map_mets()
+
+SPORTS_PHYSIOLOGY_NOTES = """
+- Recovery tax reflects how close yesterday's load was to ~2,500 MET-mins (approx. one maximal day).
+- High MET sports (boxing, running) deplete glycogen quickly; lower MET strength sessions stress musculoskeletal systems differently.
+- Alternating heavy neurological days with aerobic/skill or rest days prevents overreaching and keeps HRV within sustainable ranges.
+- Refueling should scale carbs with MET load (3-5 g/kg) and protein with tissue repair (0.3 g/kg per meal).
+"""
+
+@st.cache_data
+def met_reference_excerpt(rows: int = 30) -> str:
+    try:
+        df = pd.read_csv("MET_data.csv")
+    except FileNotFoundError:
+        return ""
+    cols = [c for c in df.columns if "Activity" in c or "MET" in c]
+    subset = df[cols].head(rows)
+    return subset.to_csv(index=False)
+
+if "meal_plans" not in st.session_state:
+    st.session_state["meal_plans"] = {}
+if "meal_dislikes" not in st.session_state:
+    st.session_state["meal_dislikes"] = {}
+if "coach_chat" not in st.session_state:
+    st.session_state["coach_chat"] = []
+
+if "meal_plans" not in st.session_state:
+    st.session_state["meal_plans"] = {}
+if "meal_dislikes" not in st.session_state:
+    st.session_state["meal_dislikes"] = {}
 
 # --- 2. UI Layout ---
 st.set_page_config(page_title="NextRep: Dynamic Workouts Tailored to you", page_icon="📈")
@@ -393,9 +425,189 @@ fatigue = st.select_slider(
     value="Normal"
 )
 
+# Initialize the Gemini API using Streamlit Secrets
+genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+
+def get_dynamic_meal(sport, duration, intensity, strain, fatigue_level, disliked=None):
+    model = genai.GenerativeModel('gemini-2.5-flash')
+    prompt = f"""
+    The user is an athlete. They just played {sport} for {duration} mins at {intensity} intensity. 
+    Their current metabolic strain is {strain} points and their fatigue level is {fatigue_level}.
+    Suggest a specific recovery meal that rotates cuisines and avoids repeating generic chicken-and-rice style dishes.
+    {"Do NOT repeat these meals: " + str(disliked) if disliked else ""}
+    You MUST output ONLY valid JSON with the exact following keys: 
+    "Meal_Name", "Protein_grams", "Carb_grams", "Fat_grams",
+    "Key_Ingredients" (an array where each element is an object with "Ingredient" and "Gram_Range" such as "20-30g"),
+    "Rationale".
+    """
+    response = model.generate_content(
+        prompt,
+        generation_config=genai.GenerationConfig(response_mime_type="application/json")
+    )
+    
+    raw_text = response.text or ""
+    try:
+        meal_data = json.loads(raw_text)
+    except (json.JSONDecodeError, TypeError):
+        st.error("AI returned invalid nutrition data. Please retry.")
+        return None
+    return meal_data
+
+
+def render_meal(meal_data, sport):
+    st.markdown(f"### 🍽️ {meal_data.get('Meal_Name', 'Recovery Meal')}")
+    st.write(f"**Rationale:** {meal_data.get('Rationale', '')}")
+    ingredients = []
+    for item in meal_data.get("Key_Ingredients", []):
+        if isinstance(item, dict):
+            ingredients.append(f"{item.get('Ingredient', 'Ingredient')} ({item.get('Gram_Range', 'n/a')})")
+        else:
+            ingredients.append(str(item))
+    st.write(f"**Ingredients:** {', '.join(ingredients)}")
+    
+    c1, c2, c3 = st.columns(3)
+    c1.metric("PROTEIN", f"{meal_data.get('Protein_grams', 0)}g")
+    c2.metric("CARBS", f"{meal_data.get('Carb_grams', 0)}g")
+    c3.metric("FATS", f"{meal_data.get('Fat_grams', 0)}g")
+
+    video_query = urllib.parse.quote_plus(f"{meal_data.get('Meal_Name', sport)} recovery recipe")
+    video_url = f"https://www.youtube.com/results?search_query={video_query}"
+    st.link_button("📺 Watch a recipe walkthrough", video_url)
+
+
+def answer_recovery_coach(question, fatigue_level, yesterday_load, tax_factor):
+    met_data = met_reference_excerpt()
+    model = genai.GenerativeModel('gemini-2.5-flash')
+    prompt = f"""
+    You are the NextRep Recovery Coach. Use the provided MET reference and sports physiology primer to answer user questions.
+    MET reference (CSV excerpt):
+    {met_data if met_data else "Unavailable"}
+
+    Sports physiology primer:
+    {SPORTS_PHYSIOLOGY_NOTES}
+
+    Current context:
+    - Fatigue state: {fatigue_level}
+    - Yesterday's strain: {int(yesterday_load)} MET-minutes
+    - Recovery tax factor: {tax_factor:.2f}
+    Question: {question}
+
+    Respond with a conversational explanation that cites specific MET insights or primer concepts.
+    """
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        return f"Recovery Coach is unavailable right now ({e})."
+
+
+def generate_weekly_plan(budget, sports, fatigue_level, yesterday_load, tax_factor):
+    model = genai.GenerativeModel('gemini-2.5-flash')
+    sport_payload = [{"sport": s, "met": round(sport_mets.get(s, 6.0), 2)} for s in sports]
+    prompt = f"""
+    You are a sports periodization coach. Build a 7-day plan that uses at most {int(budget)} MET-minutes in total.
+    Preferred sports with MET demand: {sport_payload}. Yesterday's strain was {int(yesterday_load)} MET-minutes; current fatigue is {fatigue_level}; today's recovery tax factor is {tax_factor:.2f}.
+    Rules:
+      - Heavy days must be followed by light or rest days.
+      - Once cumulative MET-minutes reach the budget, remaining days must be Rest (0 strain).
+      - Vary sports and intensities; keep each day's Target Strain realistic for that sport's MET value.
+    Output ONLY JSON with key "schedule" -> array of 7 entries.
+    Each entry must include "Day" (1-7), "Sport", "Duration (mins)" (integer), "Target Strain" (integer),
+    "Intensity" (Low/Medium/High/Rest), and "Reasoning".
+    """
+    response = model.generate_content(
+        prompt,
+        generation_config=genai.GenerationConfig(response_mime_type="application/json")
+    )
+    raw_text = response.text or ""
+    payload = json.loads(raw_text)
+    schedule = payload.get("schedule", [])
+
+    for entry in schedule:
+        if "Duration (mins)" not in entry and "Duration_mins" in entry:
+            entry["Duration (mins)"] = entry["Duration_mins"]
+        if "Target Strain" not in entry and "Target_Strain" in entry:
+            entry["Target Strain"] = entry["Target_Strain"]
+        if "Intensity" not in entry or not entry["Intensity"]:
+            entry["Intensity"] = "Rest" if entry.get("Sport", "").lower() == "rest" else "Medium"
+    return ensure_rest_day(schedule, budget)
+
+
+def _safe_positive(value):
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def ensure_rest_day(schedule, budget):
+    total_strain = sum(_safe_positive(item.get("Target Strain", item.get("Target_Strain", 0))) for item in schedule)
+    has_rest = any(str(item.get("Sport", "")).strip().lower() == "rest" for item in schedule)
+    if total_strain < budget or has_rest:
+        return schedule
+
+    used_days = {item.get("Day") for item in schedule if isinstance(item.get("Day"), int)}
+    rest_entry = {
+        "Day": next((day for day in range(1, 8) if day not in used_days), 7),
+        "Sport": "Rest",
+        "Duration (mins)": 0,
+        "Target Strain": 0,
+        "Intensity": "Rest",
+        "Reasoning": "Budget exhausted—prioritize recovery."
+    }
+
+    if len(schedule) >= 7:
+        replace_idx = min(
+            range(len(schedule)),
+            key=lambda idx: _safe_positive(schedule[idx].get("Target Strain", schedule[idx].get("Target_Strain", float("inf"))))
+        )
+        rest_entry["Day"] = schedule[replace_idx].get("Day", rest_entry["Day"])
+        schedule[replace_idx] = rest_entry
+    else:
+        schedule.append(rest_entry)
+    return schedule
+
+def derive_activity_intensity(met_value, fatigue_state, tax_factor):
+    """Calculate effort level using sport MET cost, subjective fatigue, and recovery tax."""
+    fatigue_bias = {
+        "Dead": -2.0,
+        "Very Tired": -1.5,
+        "Tired": -1.0,
+        "Slightly Tired": -0.5,
+        "Normal": 0.0,
+        "Energized": 0.5,
+        "Want to Move": 1.0,
+        "Have to Move": 1.5,
+    }
+    bias = fatigue_bias.get(fatigue_state, 0.0)
+
+    if met_value >= 9.0:
+        met_adjust = -1.0
+    elif met_value >= 7.0:
+        met_adjust = -0.5
+    elif met_value <= 5.0:
+        met_adjust = 0.5
+    else:
+        met_adjust = 0.0
+
+    if tax_factor <= 0.55:
+        load_adjust = -0.75
+    elif tax_factor >= 0.9:
+        load_adjust = 0.5
+    else:
+        load_adjust = 0.0
+
+    score = bias + met_adjust + load_adjust
+    if score >= 1.0:
+        return "High"
+    if score <= -0.5:
+        return "Low"
+    return "Medium"
+
 # --- 4. The Recommendation Engine ---
 def calculate_plan(selected_sports, y_strain, f_level):
-    if not selected_sports: return []
+    if not selected_sports: 
+        return [], 0.0, 0.0
     
     # Base Energy Budgets (MET-minutes) based on Subjective Fatigue
     f_budgets = {
@@ -418,13 +630,7 @@ def calculate_plan(selected_sports, y_strain, f_level):
         dur = int(final_budget / met)
         dur = max(10, min(150, dur)) 
         
-        # Intensity capping for safety and recovery
-        if tax_factor < 0.65 or f_level in ["Tired", "Very Tired"]:
-            rec_int = "Low"
-        elif f_level in ["Want to Move", "Have to Move"] and tax_factor > 0.85:
-            rec_int = "High"
-        else:
-            rec_int = "Medium"
+        rec_int = derive_activity_intensity(met, f_level, tax_factor)
             
         # Recovery Meal Archetypes based on MET demand
         if met > 9.0:
@@ -436,7 +642,7 @@ def calculate_plan(selected_sports, y_strain, f_level):
 
         recommendations.append({"sport": sport, "dur": dur, "int": rec_int, "meal": meal, "met": met})
     
-    return recommendations, tax_factor
+    return recommendations, tax_factor, final_budget
 
 # --- 5. Display Results ---
 # Logic: Calculate strain and tax without the 0.35 floor
@@ -447,6 +653,20 @@ yesterday_strain = y_met * y_dur * y_mult
 # Calculating TRUE tax factor (Removed the 0.35 floor)
 # If strain >= 2500, tax_factor will be 0 or negative
 tax_factor = 1.0 - (yesterday_strain / 2500)
+
+with st.sidebar:
+    st.divider()
+    st.subheader("Recovery Coach Chat")
+    for message in st.session_state["coach_chat"]:
+        prefix = "🧍‍♂️" if message["role"] == "user" else "🤖"
+        st.markdown(f"{prefix} {message['content']}")
+    coach_prompt = st.chat_input("Ask your Recovery Coach...")
+
+if coach_prompt:
+    st.session_state["coach_chat"].append({"role": "user", "content": coach_prompt})
+    reply = answer_recovery_coach(coach_prompt, fatigue, yesterday_strain, tax_factor)
+    st.session_state["coach_chat"].append({"role": "assistant", "content": reply})
+    st.rerun()
 
 # Check for Metabolic Bankruptcy or Subjective Exhaustion
 if tax_factor <= 0 or fatigue == "Dead":
@@ -464,7 +684,7 @@ if tax_factor <= 0 or fatigue == "Dead":
     st.plotly_chart(fig_dead, use_container_width=True)
 
 elif my_sports:
-    recs, tax = calculate_plan(my_sports, yesterday_strain, fatigue)
+    recs, tax, daily_budget = calculate_plan(my_sports, yesterday_strain, fatigue)
     
     st.divider()
     st.subheader("⚡ Stamina Budget")
@@ -505,21 +725,124 @@ elif my_sports:
     cols[0].metric("Yesterday's Load", f"{int(yesterday_strain)} pts")
     cols[1].metric("Recovery Adjustment", f"-{tax_pct}%")
     
-    st.write(f"### Activity Options for a **{fatigue}** state:")
-    
     # CSS to hide the "Arrow_right" and icon-font artifacts
     st.markdown("""
     <style>
     [data-testid="stExpander"] svg { display: none !important; }
-    [data-testid="stExpander"] p > span { display: none !important; }
-    .st-emotion-cache-p4m61c { display: none !important; }
     </style>
     """, unsafe_allow_html=True)
 
-    for r in recs:
+    st.write(f"### Activity Options for a **{fatigue}** state:")
+    
+    for idx, r in enumerate(recs):
         with st.expander(f"{r['sport'].upper()} | {r['dur']} MINS @ {r['int']}"):
             st.markdown(f"**PROTOCOL:** {r['dur']} MINUTES AT {r['int']} INTENSITY.")
             st.caption(f"MET VALUE: {r['met']}")
             st.divider()
-            st.markdown(f"**RECOMMENDED MEAL:** {r['meal']['t']}")
-            st.markdown(f"🎯 **FOCUS:** {r['meal']['f']}")
+            
+            # AI Fuel Integration
+            state_key = f"{r['sport']}_{idx}"
+            dislikes = st.session_state["meal_dislikes"].setdefault(state_key, [])
+            if st.button(f"🧠 Generate AI Fuel Plan", key=f"btn_{state_key}"):
+                with st.spinner("Consulting AI Nutritionist..."):
+                    meal = get_dynamic_meal(r['sport'], r['dur'], r['int'], int(yesterday_strain), fatigue, dislikes)
+                    if meal:
+                        st.session_state["meal_plans"][state_key] = meal
+
+            meal_plan = st.session_state["meal_plans"].get(state_key)
+            if meal_plan:
+                render_meal(meal_plan, r['sport'])
+                if st.button("I don't like this", key=f"btn_dislike_{state_key}_{len(dislikes)}"):
+                    if meal_plan.get("Meal_Name"):
+                        dislikes.append(meal_plan["Meal_Name"])
+                    with st.spinner("Finding an alternative..."):
+                        alt = get_dynamic_meal(r['sport'], r['dur'], r['int'], int(yesterday_strain), fatigue, dislikes)
+                        if alt:
+                            st.session_state["meal_plans"][state_key] = alt
+                    st.rerun()
+
+#AI Weekly Periodization Module
+st.divider()
+st.markdown("## 📅 AI PERIODIZATION (7-DAY FORECAST)")
+
+if not my_sports:
+    st.info("Pick at least one sport above to unlock the weekly planner.")
+else:
+    weekly_budget = max(0, int(daily_budget * 7))
+    st.caption(f"Weekly MET budget available: {weekly_budget} pts.")
+
+    if weekly_budget == 0:
+        st.warning("Recovery tax exhausted the weekly budget. Take rest before planning the next block.")
+    elif st.button("🔮 Generate Weekly Plan", type="primary"):
+        with st.spinner("Calculating weekly MET budget and generating schedule..."):
+            try:
+                schedule = generate_weekly_plan(
+                    weekly_budget,
+                    my_sports,
+                    fatigue,
+                    yesterday_strain,
+                    tax_factor
+                )
+                df_schedule = pd.DataFrame(schedule)
+                required_cols = ["Day", "Sport", "Intensity", "Duration (mins)", "Target Strain", "Reasoning"]
+                for col in required_cols:
+                    if col not in df_schedule.columns:
+                        df_schedule[col] = ""
+                df_schedule = df_schedule.sort_values("Day")
+
+                fig_week = go.Figure(
+                    data=[go.Bar(
+                        x=df_schedule["Day"].astype(str),
+                        y=df_schedule["Target Strain"],
+                        marker_color='#39FF14',
+                        text=df_schedule["Target Strain"],
+                        textposition='auto'
+                    )]
+                )
+                fig_week.update_layout(
+                    title="Weekly Strain Distribution",
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    font=dict(color='#39FF14', family='Orbitron'),
+                    xaxis=dict(showgrid=False),
+                    yaxis=dict(showgrid=False, title="Target Strain (MET-mins)")
+                )
+                st.plotly_chart(fig_week, use_container_width=True)
+
+                styled_html = df_schedule[required_cols].to_html(index=False, classes="weekly-plan-table")
+                st.markdown("""
+                <style>
+                table.weekly-plan-table{
+                    width: 100%;
+                    table-layout: fixed;
+                    border-collapse: collapse;
+                    margin-bottom: 1rem;
+                }
+                table.weekly-plan-table th,
+                table.weekly-plan-table td{
+                    border: 1px solid var(--border);
+                    padding: 8px;
+                    color: var(--text);
+                    font-family: 'Orbitron', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+                    font-size: 0.85rem;
+                    word-wrap: break-word;
+                    white-space: normal;
+                }
+                table.weekly-plan-table th{
+                    background: rgba(57,255,20,0.12);
+                    color: var(--neon);
+                    text-transform: uppercase;
+                }
+                </style>
+                """, unsafe_allow_html=True)
+                st.markdown(styled_html, unsafe_allow_html=True)
+
+                for _, row in df_schedule.iterrows():
+                    with st.expander(f"Day {int(row['Day'])}: {row['Sport']} ({row['Duration (mins)']} mins @ {row['Intensity']})"):
+                        st.write(f"**Target Strain:** {row['Target Strain']} pts")
+                        st.write(f"**Coach's Note:** {row['Reasoning']}")
+
+                if any(str(s).lower() == "rest" for s in df_schedule["Sport"]):
+                    st.caption("Rest day inserted automatically once the weekly MET budget is fully consumed.")
+            except Exception as e:
+                st.error(f"Error generating weekly plan: {e}")
